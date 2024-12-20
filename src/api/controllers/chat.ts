@@ -685,18 +685,20 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
       // 含搜索结果的处理
       if (result.choices[0].delta.type === "search_result" && !isSilentModel) {
         if (searchResults.length > 0) {
-          transStream.write(`data: ${JSON.stringify({
-            id: `${refConvId}@${result.message_id}`,
-            model: result.model,
-            object: "chat.completion.chunk",
-            choices: [
-              {
-                index: 0,
-                delta: { role: "assistant", content: `> 已为您找到 ${searchResults.length} 个网页.\n\n` },
-                finish_reason: null,
-              },
-            ],
-          })}\n\n`);
+          searchResults.forEach((item,index) => {
+            transStream.write(`data: ${JSON.stringify({
+              id: `${refConvId}@${result.message_id}`,
+              model: result.model,
+              object: "chat.completion.chunk",
+              choices: [
+                {
+                  index: 0,
+                  delta: { role: "assistant", content: `[${index+1}. ${item.title}](${item.url})\n` },
+                  finish_reason: null,
+                },
+              ],
+            })}\n\n`);
+          });
         }
 
         return;
