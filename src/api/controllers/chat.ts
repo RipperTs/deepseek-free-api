@@ -50,6 +50,9 @@ const accessTokenRequestQueueMap: Record<string, Function[]> = {};
 const workerPool: (Worker & { inUse?: boolean })[] = [];
 const MAX_WORKERS = 4; // 可以根据需要调整
 
+let streamSearchResults = []
+let streamSearchIndexs = []
+
 function getWorker() {
   // 从池中获取空闲worker或创建新worker
   let worker = workerPool.find(w => !w.inUse);
@@ -194,7 +197,7 @@ async function createSession(model: string, refreshToken: string): Promise<strin
 
 /**
  * 碰撞challenge答案
- * 
+ *
  * 厂商这个反逆向的策略不错哦
  * 相当于把计算量放在浏览器侧的话，用户分摊了这个计算量
  * 但是如果逆向在服务器上算，那这个成本都在服务器集中，并发一高就GG
@@ -281,7 +284,7 @@ async function createCompletion(
 
     const isSearchModel = model.includes('search') || prompt.includes('联网搜索');
     const isThinkingModel = model.includes('think') || model.includes('r1') || prompt.includes('深度思考');
-    
+
     let challenge;
     if (isThinkingModel) {
       const thinkingQuota = await getThinkingQuota(refreshToken);
@@ -665,10 +668,23 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
       if (!result.choices || !result.choices[0] || !result.choices[0].delta)
         return;
       result.model = model;
+
+      const content = result.choices[0].delta?.content || '';
+      const citation = content.match(/\[citation:(\d+)\]/);
+      const searchResults = result.choices[0]?.delta?.search_results || [];
+      const searchIndex = result.choices[0]?.delta?.search_indexes || [];
+
+      if (searchResults.length) {
+        streamSearchResults = searchResults;
+      }
+
+      if(searchIndex.length){
+        streamSearchIndexs = searchIndex;
+      }
+
+      // 含搜索结果的处理
       if (result.choices[0].delta.type === "search_result" && !isSilentModel) {
-        const searchResults = result.choices[0]?.delta?.search_results || [];
         if (searchResults.length > 0) {
-          const refContent = searchResults.map(item => `检索 ${item.title} - ${item.url}`).join('\n') + '\n\n';
           transStream.write(`data: ${JSON.stringify({
             id: `${refConvId}@${result.message_id}`,
             model: result.model,
@@ -676,12 +692,13 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
             choices: [
               {
                 index: 0,
-                delta: { role: "assistant", content: refContent },
+                delta: { role: "assistant", content: `> 已为您找到 ${searchResults.length} 个网页.\n\n` },
                 finish_reason: null,
               },
             ],
           })}\n\n`);
         }
+
         return;
       }
       if (result.choices[0].delta.type === "thinking") {
@@ -724,19 +741,48 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
       if(!result.choices[0].delta.content)
         return;
 
-      transStream.write(`data: ${JSON.stringify({
-        id: `${refConvId}@${result.message_id}`,
-        model: result.model,
-        object: "chat.completion.chunk",
-        choices: [
-          {
-            index: 0,
-            delta: { role: "assistant", content: result.choices[0].delta.content.replace(/\[citation:\d+\]/g, '') },
-            finish_reason: null,
-          },
-        ],
-        created,
-      })}\n\n`);
+
+      if (citation === null){
+        transStream.write(`data: ${JSON.stringify({
+          id: `${refConvId}@${result.message_id}`,
+          model: result.model,
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: content },
+              finish_reason: null,
+            },
+          ],
+          created,
+        })}\n\n`);
+      }
+
+      // 匹配引用详情
+      if(streamSearchResults.length && streamSearchIndexs.length && citation && !isSilentModel) {
+        const citeUrl = streamSearchIndexs.find(item=>item.cite_index === parseInt(citation[1]))?.url || '';
+        const refContents = streamSearchResults.find(item=>item.url === citeUrl) || {};
+        let source_label = refContents?.site_name || '';
+        if (source_label.trim() === ''){
+          source_label = 'none';
+        }
+        let source_url = refContents?.url || '';
+        transStream.write(`data: ${JSON.stringify({
+          id: `${refConvId}@${result.message_id}`,
+          model: result.model,
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: ` [^${source_label}^](${source_url}) ` },
+              finish_reason: null,
+            },
+          ],
+          created,
+        })}\n\n`);
+
+      }
+
       if (result.choices && result.choices[0] && result.choices[0].finish_reason === "stop") {
         transStream.write(`data: ${JSON.stringify({
           id: `${refConvId}@${result.message_id}`,
