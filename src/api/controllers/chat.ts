@@ -7,6 +7,7 @@ import path from 'path';
 import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
 import {createParser} from "eventsource-parser";
+import { DeepSeekHash } from "@/lib/challenge.ts";
 import logger from "@/lib/logger.ts";
 import util from "@/lib/util.ts";
 
@@ -14,6 +15,8 @@ import util from "@/lib/util.ts";
 const MODEL_NAME = "deepseek-chat";
 // access_token有效期
 const ACCESS_TOKEN_EXPIRES = 3600;
+// 插冷鸡WASM文件路径
+const WASM_PATH = './35144cac553a7a2a.wasm';
 // 最大重试次数
 const MAX_RETRY_COUNT = 3;
 // 重试延迟
@@ -191,7 +194,7 @@ async function createSession(model: string, refreshToken: string): Promise<strin
   );
   const {biz_data} = checkResult(result, refreshToken);
   if (!biz_data)
-    throw new APIException(EX.API_REQUEST_FAILED, "创建会话失败，可能是账号或IP地址被封禁");
+    throw new APIException(EX.API_REQUEST_FAILED, "创建会话失败，请稍后再试.");
   return biz_data.id;
 }
 
@@ -202,30 +205,18 @@ async function createSession(model: string, refreshToken: string): Promise<strin
  * 相当于把计算量放在浏览器侧的话，用户分摊了这个计算量
  * 但是如果逆向在服务器上算，那这个成本都在服务器集中，并发一高就GG
  */
-function answerChallenge(response: any): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const worker = getWorker();
-    if (!worker) {
-      reject(new Error('No available workers'));
-      return;
-    }
-
-    worker.once('message', (result) => {
-      releaseWorker(worker);
-      if (result.error) {
-        reject(new Error(result.error));
-      } else {
-        resolve(result);
-      }
-    });
-
-    worker.once('error', (error) => {
-      releaseWorker(worker);
-      reject(error);
-    });
-
-    worker.postMessage(response);
-  });
+async function answerChallenge(response: any): Promise<any> {
+  const {algorithm, challenge, salt, difficulty, expire_at, signature} = response;
+  const deepSeekHash = new DeepSeekHash();
+  await deepSeekHash.init(WASM_PATH);
+  const answer = deepSeekHash.calculateHash(algorithm, challenge, salt, difficulty, expire_at);
+  return {
+    algorithm,
+    challenge,
+    salt,
+    answer,
+    signature
+  }
 }
 
 /**
@@ -286,11 +277,17 @@ async function createCompletion(
     const isThinkingModel = model.includes('think') || model.includes('r1') || prompt.includes('深度思考');
 
     let challenge;
+    if(isSearchModel && isThinkingModel){
+      throw new APIException(EX.API_REQUEST_FAILED, '深度思考和联网搜索不能同时使用');
+    }
     if (isThinkingModel) {
       const thinkingQuota = await getThinkingQuota(refreshToken);
       if (thinkingQuota <= 0) {
         throw new APIException(EX.API_REQUEST_FAILED, '深度思考配额不足');
       }
+    }
+
+    if (isSearchModel || isThinkingModel){
       const challengeResponse = await getChallengeResponse(refreshToken);
       challenge = await answerChallenge(challengeResponse);
       logger.info(`插冷鸡: ${JSON.stringify(challenge)}`);
@@ -396,6 +393,9 @@ async function createCompletionStream(
       if (thinkingQuota <= 0) {
         throw new APIException(EX.API_REQUEST_FAILED, '深度思考配额不足');
       }
+    }
+
+    if (isSearchModel || isThinkingModel){
       const challengeResponse = await getChallengeResponse(refreshToken);
       challenge = await answerChallenge(challengeResponse);
       logger.info(`插冷鸡: ${JSON.stringify(challenge)}`);
@@ -405,6 +405,15 @@ async function createCompletionStream(
     const sessionId = refSessionId || await createSession(model, refreshToken);
     // 请求流
     const token = await acquireToken(refreshToken);
+    console.log({
+      chat_session_id: sessionId,
+      parent_message_id: refParentMsgId || null,
+      prompt,
+      challenge_response: challenge,
+      ref_file_ids: [],
+      search_enabled: isSearchModel,
+      thinking_enabled: isThinkingModel
+    })
 
     const result = await axios.post(
       "https://chat.deepseek.com/api/v0/chat/completion",
@@ -450,7 +459,7 @@ async function createCompletionStream(
               index: 0,
               delta: {
                 role: "assistant",
-                content: "服务暂时不可用，第三方响应错误",
+                content: "服务暂时不可用，请稍后再试.",
               },
               finish_reason: "stop",
             },
